@@ -47,27 +47,31 @@ function stripeApiPlugin(): Plugin {
               }
 
               // Real Stripe Checkout Session
-              const session = await stripe.checkout.sessions.create({
-                payment_method_types: ['card'],
-                line_items: [
-                  {
-                    price_data: {
-                      currency: 'eur',
-                      product_data: {
-                        name: planId === 'plan_starter' ? 'TouchBizz Starter (Abonnement Mensuel)' : 'TouchBizz Pro (Abonnement Mensuel)',
-                        description: 'Abonnement SaaS Menu Digital NFC & QR Code TouchBizz',
+                const origin = (req.headers.origin as string) || (req.headers.host ? `https://${req.headers.host}` : process.env.APP_URL || '');
+                const successUrl = returnUrl || (origin ? `${origin}/dashboard/settings?session_id={CHECKOUT_SESSION_ID}` : '/dashboard/settings?session_id={CHECKOUT_SESSION_ID}');
+                const cancelUrl = parsed.cancelUrl || (origin ? `${origin}/dashboard/settings?canceled=true` : '/dashboard/settings?canceled=true');
+
+                const session = await stripe.checkout.sessions.create({
+                  payment_method_types: ['card'],
+                  line_items: [
+                    {
+                      price_data: {
+                        currency: 'eur',
+                        product_data: {
+                          name: planId === 'plan_starter' ? 'TouchBizz Starter (Abonnement Mensuel)' : 'TouchBizz Pro (Abonnement Mensuel)',
+                          description: 'Abonnement SaaS Menu Digital NFC & QR Code TouchBizz',
+                        },
+                        unit_amount: planId === 'plan_starter' ? 1900 : 2900,
+                        recurring: { interval: 'month' },
                       },
-                      unit_amount: planId === 'plan_starter' ? 1900 : 2900,
-                      recurring: { interval: 'month' },
+                      quantity: 1,
                     },
-                    quantity: 1,
-                  },
-                ],
-                mode: 'subscription',
-                customer_email: userEmail || undefined,
-                success_url: returnUrl || 'http://localhost:3000/dashboard/settings?session_id={CHECKOUT_SESSION_ID}',
-                cancel_url: parsed.cancelUrl || 'http://localhost:3000/dashboard/settings?canceled=true',
-              });
+                  ],
+                  mode: 'subscription',
+                  customer_email: userEmail || undefined,
+                  success_url: successUrl,
+                  cancel_url: cancelUrl,
+                });
 
               res.setHeader('Content-Type', 'application/json');
               res.end(JSON.stringify({ success: true, url: session.url }));

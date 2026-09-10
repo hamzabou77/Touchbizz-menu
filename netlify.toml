@@ -1,0 +1,31 @@
+# ==============================================================================
+# TouchBizz Menu - Netlify Configuration for Testing & Staging
+# ==============================================================================
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# 1. API Route: Forward all /api/* requests to Netlify Serverless Function
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+  force = true
+
+# 2. SPA Fallback: Forward all application routes (/dashboard, /r/:slug, etc.) to index.html with HTTP 200
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# Security & CORS Headers
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    Access-Control-Allow-Origin = "*"

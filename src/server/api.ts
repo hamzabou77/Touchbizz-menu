@@ -13,20 +13,9 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Multer disk storage for uploaded restaurant photos and logos
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, uploadsDir);
-  },
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    cb(null, 'img-' + uniqueSuffix + ext);
-  },
-});
-
+// Multer memory storage compatible with both disk writing (Hostinger) and serverless functions (Netlify)
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB max
   fileFilter: (_req, file, cb) => {
     if (file.mimetype.startsWith('image/')) {
@@ -809,24 +798,48 @@ apiRouter.post('/upload', requireAuth, upload.single('image'), async (req: Authe
   try {
     // 1. If uploaded via multipart file
     if (req.file) {
-      const publicUrl = `/uploads/${req.file.filename}`;
-      res.json({ success: true, url: publicUrl });
-      return;
+      const ext = path.extname(req.file.originalname).toLowerCase() || '.jpg';
+      const generatedName = `img-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+
+      try {
+        if (!fs.existsSync(uploadsDir)) {
+          fs.mkdirSync(uploadsDir, { recursive: true });
+        }
+        const filePath = path.join(uploadsDir, generatedName);
+        fs.writeFileSync(filePath, req.file.buffer);
+        res.json({ success: true, url: `/uploads/${generatedName}` });
+        return;
+      } catch (fsErr) {
+        // Read-only filesystem in serverless environments (Netlify)
+        console.warn('[TouchBizz Upload] Disque en lecture seule (Netlify Serverless), conversion directe en Data URI.');
+        const dataUrl = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+        res.json({ success: true, url: dataUrl });
+        return;
+      }
     }
 
     // 2. If uploaded via Base64 data URL
-    const { data, filename } = req.body;
+    const { data } = req.body;
     if (data && typeof data === 'string' && data.startsWith('data:image/')) {
-      const matches = data.match(/^data:image\/([a-zA-Z0-9+]+);base64,(.+)$/);
-      if (matches) {
-        const ext = matches[1] === 'jpeg' ? 'jpg' : matches[1];
-        const base64Data = matches[2];
-        const generatedName = `img-${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`;
-        const filePath = path.join(uploadsDir, generatedName);
-        fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
+      try {
+        if (!fs.existsSync(uploadsDir)) {
+          fs.mkdirSync(uploadsDir, { recursive: true });
+        }
+        const matches = data.match(/^data:image\/([a-zA-Z0-9+]+);base64,(.+)$/);
+        if (matches) {
+          const ext = matches[1] === 'jpeg' ? 'jpg' : matches[1];
+          const base64Data = matches[2];
+          const generatedName = `img-${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`;
+          const filePath = path.join(uploadsDir, generatedName);
+          fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
 
-        const publicUrl = `/uploads/${generatedName}`;
-        res.json({ success: true, url: publicUrl });
+          res.json({ success: true, url: `/uploads/${generatedName}` });
+          return;
+        }
+      } catch (fsErr) {
+        // Read-only filesystem in serverless environments (Netlify)
+        console.warn('[TouchBizz Upload] Disque en lecture seule (Netlify Serverless), conservation du Data URI.');
+        res.json({ success: true, url: data });
         return;
       }
     }

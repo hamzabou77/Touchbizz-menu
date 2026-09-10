@@ -446,7 +446,6 @@ async function autoMigrateTables() {
     const schemaPath = path.join(process.cwd(), 'schema.sql');
     if (fs.existsSync(schemaPath)) {
       const sql = fs.readFileSync(schemaPath, 'utf8');
-      // Split into statements ignoring comments
       const statements = sql
         .replace(/--.*$/gm, '')
         .split(';')
@@ -457,14 +456,89 @@ async function autoMigrateTables() {
         try {
           await pool.query(statement);
         } catch (e: any) {
-          // Ignore duplicate / already existing table errors
           if (!e.message.includes('already exists') && !e.message.includes('Duplicate')) {
             console.warn('[TouchBizz MySQL Auto-migration warning]:', e.message);
           }
         }
       }
-      console.log('[TouchBizz MySQL] Schema verified & auto-migrated successfully.');
+      console.log('[TouchBizz MySQL] Schema verified & auto-migrated from schema.sql.');
+      return;
     }
+
+    // Fallback embedded DDL for serverless environments where schema.sql is not in bundle
+    const embeddedDDL = [
+      `CREATE TABLE IF NOT EXISTS users (
+        id VARCHAR(64) NOT NULL,
+        email VARCHAR(191) NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        name VARCHAR(191) NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_users_email (email)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;`,
+      `CREATE TABLE IF NOT EXISTS restaurants (
+        id VARCHAR(64) NOT NULL,
+        owner_id VARCHAR(64) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        slug VARCHAR(255) NOT NULL,
+        logo_url MEDIUMTEXT NULL,
+        cover_image_url MEDIUMTEXT NULL,
+        description TEXT NULL,
+        phone VARCHAR(64) DEFAULT '',
+        address TEXT NULL,
+        currency VARCHAR(32) DEFAULT 'DH',
+        primary_color VARCHAR(32) DEFAULT '#9A3412',
+        theme VARCHAR(32) DEFAULT 'modern',
+        is_published TINYINT(1) DEFAULT 1,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_restaurants_slug (slug),
+        KEY idx_restaurants_owner (owner_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;`,
+      `CREATE TABLE IF NOT EXISTS categories (
+        id VARCHAR(64) NOT NULL,
+        restaurant_id VARCHAR(64) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        description TEXT NULL,
+        sort_order INT NOT NULL DEFAULT 0,
+        display_order INT NOT NULL DEFAULT 0,
+        is_visible TINYINT(1) NOT NULL DEFAULT 1,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_categories_restaurant (restaurant_id, display_order)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;`,
+      `CREATE TABLE IF NOT EXISTS menu_items (
+        id VARCHAR(64) NOT NULL,
+        restaurant_id VARCHAR(64) NOT NULL,
+        category_id VARCHAR(64) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        description TEXT NULL,
+        price DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
+        image_url MEDIUMTEXT NULL,
+        sort_order INT NOT NULL DEFAULT 0,
+        display_order INT NOT NULL DEFAULT 0,
+        is_available TINYINT(1) NOT NULL DEFAULT 1,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_menu_items_restaurant (restaurant_id, display_order),
+        KEY idx_menu_items_category (category_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;`
+    ];
+
+    for (const statement of embeddedDDL) {
+      try {
+        await pool.query(statement);
+      } catch (e: any) {
+        if (!e.message.includes('already exists')) {
+          console.warn('[TouchBizz MySQL Embedded DDL warning]:', e.message);
+        }
+      }
+    }
+    console.log('[TouchBizz MySQL] Schema verified & auto-migrated from embedded DDL.');
   } catch (err) {
     console.warn('[TouchBizz MySQL] Auto-migration error:', err);
   }
@@ -472,14 +546,50 @@ async function autoMigrateTables() {
 
 /**
  * Parameterized Query Execution (Secured against SQL Injection)
+ * Enforces production-grade strictness: never silently fall back to mock data
+ * when MySQL credentials are configured or in production/Netlify environments.
  */
 export async function query<T = any>(sql: string, params: any[] = []): Promise<T[]> {
-  if (pool && isConnected) {
-    const [rows] = await pool.execute(sql, params);
-    return rows as T[];
+  const config = getDbConfig();
+  const isProductionOrNetlify = process.env.NODE_ENV === 'production' || Boolean(process.env.NETLIFY);
+
+  // In production, on Netlify, or when MySQL is configured:
+  if (config.isConfigured || isProductionOrNetlify) {
+    if (!config.isConfigured) {
+      throw new Error(
+        '[TouchBizz MySQL] Configuration manquante : DB_HOST, DB_USER, DB_PASSWORD et DB_NAME doivent être configurés dans vos variables d’environnement.'
+      );
+    }
+
+    if (!pool || !isConnected) {
+      const initResult = await initDatabase();
+      if (!initResult.success) {
+        throw new Error(
+          `[TouchBizz MySQL] Connexion impossible à la base de données (${config.host}:${config.port}/${config.database}) : ${initResult.message}. Vérifiez vos variables d’environnement.`
+        );
+      }
+    }
+
+    try {
+      const [rows] = await pool!.execute(sql, params);
+      return rows as T[];
+    } catch (err: any) {
+      if (err.code === 'PROTOCOL_CONNECTION_LOST' || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT') {
+        console.warn('[TouchBizz MySQL] Connexion perdue, tentative de reconnexion...');
+        isConnected = false;
+        await initDatabase();
+        if (pool && isConnected) {
+          const [rows] = await pool.execute(sql, params);
+          return rows as T[];
+        }
+      }
+      console.error('[TouchBizz MySQL Query Error]:', err.message);
+      // Strictly throw error - do NOT fall back to fake data in production or when configured
+      throw err;
+    }
   }
 
-  // If MySQL is not connected, simulate the parameterized query on memoryStore
+  // Fallback ONLY in local development / AI Studio preview without any DB credentials configured:
   return executeInMemory<T>(sql, params);
 }
 
